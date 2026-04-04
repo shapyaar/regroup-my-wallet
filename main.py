@@ -6,7 +6,7 @@ from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from web3 import Web3
-
+from keep_alive import keep_alive
 # --- تنظیمات تلگرام ---
 BOT_TOKEN = '8668017334:AAHMHyPg_LAlYtzlcggKGhBjbGHXNLspylk'
 SOURCE_CHANNEL_ID = '@rrxfq'    # کانال 1 (مبدأ فایل‌ها)
