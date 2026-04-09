@@ -152,7 +152,10 @@ if __name__ == '__main__':
     application.add_handler(
         MessageHandler(filters.ChatType.CHANNEL & filters.Document.ALL, process_report_file)
     )
-    # اجرای polling تلگرام
-    threading.Thread(target=application.run_polling).start()
-    # اجرای flask روی پورت Render
-    app.run(host="0.0.0.0", port=10000)
+    keep_alive()  # این خط را نگه دارید، لازم است
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application.add_handler(
+        MessageHandler(filters.ChatType.CHANNEL & filters.Document.ALL, process_report_file)
+    )
+# مستقیم اجرا می‌کنیم، بدون Thread و بدون app.run
+    application.run_polling()
