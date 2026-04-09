@@ -148,8 +148,7 @@ async def run_job():
     updates = await bot.get_updates()  # آخرین آپدیت‌ها
     for update in updates:
         # فقط فایل‌های کانال
-        if getattr(update, "channel_post", None) and getattr(update.channe
-                                                            ‍0l_post, "document", None):
+        if getattr(update, "channel_post", None) and getattr(update.channel_post, "document", None):
             # شبیه‌سازی ContextType
             class DummyContext:
                 bot = bot
