@@ -7,7 +7,13 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from web3 import Web3
 from keep_alive import keep_alive
+from flask import Flask
 
+app = Flask(__name__)
+
+@app.route('/')
+def home():
+    return "Bot is running"
 # --- تنظیمات ---
 BOT_TOKEN = '8668017334:AAHMHyPg_LAlYtzlcggKGhBjbGHXNLspylk'
 SOURCE_CHANNEL_ID = '@rrxfq'
