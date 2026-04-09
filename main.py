@@ -152,5 +152,4 @@ if __name__ == '__main__':
     application.add_handler(
         MessageHandler(filters.ChatType.CHANNEL & filters.Document.ALL, process_report_file)
     )
-    application.run_polling()app.run اضافی
-    application.run_polling()
+    application.run_polling()  # این خط تنها کافی است
