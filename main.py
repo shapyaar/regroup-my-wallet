@@ -8,8 +8,20 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filte
 from web3 import Web3
 from keep_alive import keep_alive
 
+from flask import Flask, request
+from telegram import Update
+
 app = Flask(__name__)
 
+application = ApplicationBuilder().token(BOT_TOKEN).build()
+application.add_handler(
+    MessageHandler(filters.ChatType.CHANNEL & filters.Document.ALL, process_report_file)
+)
+@app.route(f"/{BOT_TOKEN}", methods=["POST"])
+def webhook():
+    update = Update.de_json(request.get_json(force=True), application.bot)
+    application.update_queue.put_nowait(update)
+    return "OK"
 @app.route('/')
 def home():
     return "Bot is running"
@@ -136,7 +148,8 @@ async def run_job():
     updates = await bot.get_updates()  # آخرین آپدیت‌ها
     for update in updates:
         # فقط فایل‌های کانال
-        if getattr(update, "channel_post", None) and getattr(update.channel_post, "document", None):
+        if getattr(update, "channel_post", None) and getattr(update.channe
+                                                            ‍0l_post, "document", None):
             # شبیه‌سازی ContextType
             class DummyContext:
                 bot = bot
@@ -146,10 +159,10 @@ async def run_job():
 # =========================
 # اجرای اصلی
 # =========================
-if __name__ == '__main__':
-    keep_alive()  # اجرای وب‌سرویس
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
-    application.add_handler(
-        MessageHandler(filters.ChatType.CHANNEL & filters.Document.ALL, process_report_file)
-    )
-    application.run_polling()  # این خط تنها کافی است
+if __name__ == "__main__":
+    keep_alive()
+
+    WEBHOOK_URL = "https://regroup-my-wallet.onrender.com/" + '8668017334:AAHMHyPg_LAlYtzlcggKGhBjbGHXNLspylk'
+    application.bot.set_webhook(WEBHOOK_URL)
+
+    app.run(host="0.0.0.0", port=10000)
