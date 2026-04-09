@@ -147,12 +147,10 @@ async def run_job():
 # اجرای اصلی
 # =========================
 if __name__ == '__main__':
-    keep_alive()  # اجرای وب‌سرویس برای ping
-    # ساخت یکبار ربات
+    keep_alive()  # اجرای وب‌سرویس
     application = ApplicationBuilder().token(BOT_TOKEN).build()
-    # اضافه کردن handler فقط یکبار
     application.add_handler(
         MessageHandler(filters.ChatType.CHANNEL & filters.Document.ALL, process_report_file)
     )
-    # اجرای polling بدون Thread یا app.run اضافی
+    application.run_polling()app.run اضافی
     application.run_polling()
