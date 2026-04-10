@@ -8,13 +8,12 @@ from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filte
 from web3 import Web3
 from keep_alive import keep_alive
 
-# تنظیمات لاگ
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# --- تنظیمات اصلی ---
+# --- تنظیمات ---
 BOT_TOKEN = '8668017334:AAHMHyPg_LAlYtzlcggKGhBjbGHXNLspylk'
-SOURCE_CHANNEL = 'rrxfq' # یوزرنیم کانال منبع بدون @
-REPORT_CHANNEL = '@regroupmywallet' # کانال مقصد گزارش
+SOURCE_CHANNEL = 'rrxfq'
+REPORT_CHANNEL = '@regroupmywallet'
 
 NETWORKS = {
     'ETH': 'https://eth.llamarpc.com',
@@ -29,78 +28,74 @@ def get_wallet_total(address):
     for net, rpc in NETWORKS.items():
         try:
             w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 5}))
-            checksum = Web3.to_checksum_address(address)
+            checksum = Web3.to_checksum_address(address.strip())
             balance = w3.eth.get_balance(checksum)
             if balance > 0:
                 local_totals[net] = float(w3.from_wei(balance, 'ether'))
-        except:
-            continue
+        except: continue
     return local_totals
 
 async def process_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ۱. بررسی منبع پیام: فقط پست‌های کانال سورس پردازش شوند
-    if not update.channel_post:
-        return
-    
-    current_chat = update.channel_post.chat
-    if not current_chat.username or current_chat.username.lower() != SOURCE_CHANNEL.lower():
+    # لاگ برای هر پیام دریافتی در کنسول رندر
+    logging.info("New message received in a channel...")
+
+    if not update.channel_post or not update.channel_post.document:
         return
 
-    # ۲. بررسی وجود فایل
+    # بررسی منبع
+    chat = update.channel_post.chat
+    if not chat.username or chat.username.lower() != SOURCE_CHANNEL.lower():
+        logging.info(f"Message from unknown channel: {chat.username}")
+        return
+
     doc = update.channel_post.document
-    if not doc or not doc.file_name or 'report' not in doc.file_name.lower():
-        return
+    logging.info(f"Target file found: {doc.file_name}")
 
-    logging.info(f"🚀 فایل هدف پیدا شد: {doc.file_name}")
-    
     try:
-        # ارسال پیام شروع به کانال ریپورت
-        await context.bot.send_message(chat_id=REPORT_CHANNEL, text=f"📥 فایل جدید در `{SOURCE_CHANNEL}` دریافت شد.\n🔍 در حال محاسبه موجودی کل آدرس‌های داخل فایل...")
+        # اطلاع‌رسانی فوری در کانال مقصد
+        await context.bot.send_message(chat_id=REPORT_CHANNEL, text=f"📥 فایل `{doc.file_name}` در کانال سورس رویت شد.\n⏳ شروع استخراج آدرس‌ها و استعلام موجودی...")
 
-        # دانلود فایل
-        tg_file = await context.bot.get_file(doc.file_id)
-        file_content = await tg_file.download_as_bytearray()
-        text = file_content.decode('utf-8', errors='ignore')
+        file = await context.bot.get_file(doc.file_id)
+        content = await file.download_as_bytearray()
+        text = content.decode('utf-8', errors='ignore')
 
-        # استخراج آدرس‌ها
-        addresses = re.findall(r"0x[a-fA-F0-9]{40}", text)
-        unique_addrs = list(set(addresses))
+        # استخراج تمام آدرس‌ها
+        addresses = list(set(re.findall(r"0x[a-fA-F0-9]{40}", text)))
         
-        if not unique_addrs:
-            await context.bot.send_message(chat_id=REPORT_CHANNEL, text=f"⚠️ فایل `{doc.file_name}` خالی از آدرس بود.")
+        if not addresses:
+            await context.bot.send_message(chat_id=REPORT_CHANNEL, text=f"❌ هیچ آدرس ولتی در فایل `{doc.file_name}` یافت نشد.")
             return
 
-        # پردازش موازی برای سرعت بالا
+        # پردازش موازی سریع
         file_totals = {net: 0.0 for net in NETWORKS}
-        with ThreadPoolExecutor(max_workers=25) as executor:
+        with ThreadPoolExecutor(max_workers=30) as executor:
             loop = asyncio.get_event_loop()
-            tasks = [loop.run_in_executor(executor, get_wallet_total, addr) for addr in unique_addrs]
+            tasks = [loop.run_in_executor(executor, get_wallet_total, addr) for addr in addresses]
             results = await asyncio.gather(*tasks)
 
         for res in results:
             for net in NETWORKS:
                 file_totals[net] += res[net]
 
-        # ساخت گزارش نهایی
-        report_msg = f"✅ **گزارش مجموع موجودی فایل**\n"
-        report_msg += f"📄 فایل: `{doc.file_name}`\n"
-        report_msg += f"🔢 تعداد ولت: `{len(unique_addrs)}`\n"
+        # ارسال گزارش نهایی
+        report_msg = f"📊 **گزارش موجودی کل فایل**\n"
+        report_msg += f"📄 نام فایل: `{doc.file_name}`\n"
+        report_msg += f"🔢 تعداد آدرس اسکن شده: `{len(addresses)}`\n"
         report_msg += "──────────────────\n"
         for net, amount in file_totals.items():
             report_msg += f"🔹 {net}: `{amount:.6f}`\n"
         report_msg += "──────────────────"
         
         await context.bot.send_message(chat_id=REPORT_CHANNEL, text=report_msg, parse_mode='Markdown')
+        logging.info("Done!")
 
     except Exception as e:
         logging.error(f"Error: {e}")
+        await context.bot.send_message(chat_id=REPORT_CHANNEL, text=f"❌ خطای سیستمی: {str(e)}")
 
 if __name__ == '__main__':
     keep_alive()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    
-    # فیلتر فقط برای اسناد در کانال
     app.add_handler(MessageHandler(filters.ChatType.CHANNEL & filters.Document.ALL, process_report))
-    
-    logging.info(f"🤖 ربات فعال شد. در حال مانیتور کانال @{SOURCE_CHANNEL}...")
+    logging.info("Bot is running and waiting for file...")
     app.run_polling(drop_pending_updates=True)
