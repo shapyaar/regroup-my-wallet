@@ -1,19 +1,20 @@
 import os
 import re
-import asyncio
 import logging
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, MessageHandler, filters
 from web3 import Web3
 from keep_alive import keep_alive
 
-# تنظیمات لاگ برای دیدن خطاها در کنسول
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+# تنظیمات لاگ
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
-# --- تنظیمات ---
+# --- تنظیمات اصلی ---
 BOT_TOKEN = '8668017334:AAHMHyPg_LAlYtzlcggKGhBjbGHXNLspylk'
-SOURCE_CHANNEL = 'rrxfq' # بدون @ برای مقایسه راحت‌تر
-REPORT_CHANNEL_ID = '@regroupmywallet'
+SOURCE_CHANNEL = 'rrxfq' # یوزرنیم کانال منبع بدون @
+REPORT_CHANNEL = '@regroupmywallet' # کانال مقصد گزارش
 
 NETWORKS = {
     'ETH': 'https://eth.llamarpc.com',
@@ -23,86 +24,83 @@ NETWORKS = {
     'OP': 'https://mainnet.optimism.io'
 }
 
-def check_all_balances(address):
-    results = {}
-    for name, rpc in NETWORKS.items():
+def get_wallet_total(address):
+    local_totals = {net: 0.0 for net in NETWORKS}
+    for net, rpc in NETWORKS.items():
         try:
-            # ایجاد اتصال جدید برای هر درخواست جهت جلوگیری از بلاک شدن
-            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 10}))
-            checksum_addr = Web3.to_checksum_address(address.strip())
-            bal_wei = w3.eth.get_balance(checksum_addr)
-            results[name] = float(w3.from_wei(bal_wei, 'ether'))
-        except Exception as e:
-            logging.error(f"Error checking {name} for {address}: {e}")
-            results[name] = 0.0
-    return results
+            w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 5}))
+            checksum = Web3.to_checksum_address(address)
+            balance = w3.eth.get_balance(checksum)
+            if balance > 0:
+                local_totals[net] = float(w3.from_wei(balance, 'ether'))
+        except:
+            continue
+    return local_totals
 
-async def process_report_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # لاگ کردن برای تست: آیا پیامی دریافت شد؟
-    logging.info("A new post detected in a channel...")
-
+async def process_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # ۱. بررسی منبع پیام: فقط پست‌های کانال سورس پردازش شوند
     if not update.channel_post:
         return
-
-    # بررسی یوزرنیم کانال (حساس نبودن به بزرگ و کوچکی حروف)
+    
     current_chat = update.channel_post.chat
     if not current_chat.username or current_chat.username.lower() != SOURCE_CHANNEL.lower():
-        logging.info(f"Message ignored from: {current_chat.username}")
         return
 
+    # ۲. بررسی وجود فایل
     doc = update.channel_post.document
-    if not doc:
-        logging.info("Post has no document.")
+    if not doc or not doc.file_name or 'report' not in doc.file_name.lower():
         return
 
-    logging.info(f"Processing file: {doc.file_name}")
-
+    logging.info(f"🚀 فایل هدف پیدا شد: {doc.file_name}")
+    
     try:
-        # اطلاع‌رسانی اولیه در کانال ریپورت
-        await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=f"📥 دریافت فایل `{doc.file_name}` از سورس. در حال محاسبه...")
+        # ارسال پیام شروع به کانال ریپورت
+        await context.bot.send_message(chat_id=REPORT_CHANNEL, text=f"📥 فایل جدید در `{SOURCE_CHANNEL}` دریافت شد.\n🔍 در حال محاسبه موجودی کل آدرس‌های داخل فایل...")
 
-        file = await context.bot.get_file(doc.file_id)
-        content_bytes = await file.download_as_bytearray()
-        content = content_bytes.decode('utf-8', errors='ignore')
+        # دانلود فایل
+        tg_file = await context.bot.get_file(doc.file_id)
+        file_content = await tg_file.download_as_bytearray()
+        text = file_content.decode('utf-8', errors='ignore')
 
-        addresses = re.findall(r"0x[a-fA-F0-9]{40}", content)
+        # استخراج آدرس‌ها
+        addresses = re.findall(r"0x[a-fA-F0-9]{40}", text)
+        unique_addrs = list(set(addresses))
         
-        # اگر آدرسی پیدا نشد، باز هم گزارش بده
-        if not addresses:
-            await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=f"⚠️ فایل `{doc.file_name}` اسکن شد اما هیچ آدرس ولتی (0x...) در آن یافت نشد.")
+        if not unique_addrs:
+            await context.bot.send_message(chat_id=REPORT_CHANNEL, text=f"⚠️ فایل `{doc.file_name}` خالی از آدرس بود.")
             return
 
-        total_summary = {net: 0.0 for net in NETWORKS.keys()}
-        
-        # پیمایش آدرس‌ها و جمع زدن موجودی
-        for addr in set(addresses): # استفاده از set برای حذف آدرس‌های تکراری در یک فایل
-            balances = check_all_balances(addr)
-            for net, amount in balances.items():
-                total_summary[net] += amount
+        # پردازش موازی برای سرعت بالا
+        file_totals = {net: 0.0 for net in NETWORKS}
+        with ThreadPoolExecutor(max_workers=25) as executor:
+            loop = asyncio.get_event_loop()
+            tasks = [loop.run_in_executor(executor, get_wallet_total, addr) for addr in unique_addrs]
+            results = await asyncio.gather(*tasks)
+
+        for res in results:
+            for net in NETWORKS:
+                file_totals[net] += res[net]
 
         # ساخت گزارش نهایی
-        report = f"📋 **گزارش موجودی کل فایل**\n"
-        report += f"📄 نام فایل: `{doc.file_name}`\n"
-        report += f"🔢 تعداد آدرس‌ها: {len(addresses)}\n"
-        report += "──────────────────\n"
-        for net, total in total_summary.items():
-            report += f"🔹 {net}: `{total:.6f}`\n"
-        report += "──────────────────"
-
-        await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=report, parse_mode='Markdown')
-        logging.info("Report sent successfully.")
+        report_msg = f"✅ **گزارش مجموع موجودی فایل**\n"
+        report_msg += f"📄 فایل: `{doc.file_name}`\n"
+        report_msg += f"🔢 تعداد ولت: `{len(unique_addrs)}`\n"
+        report_msg += "──────────────────\n"
+        for net, amount in file_totals.items():
+            report_msg += f"🔹 {net}: `{amount:.6f}`\n"
+        report_msg += "──────────────────"
+        
+        await context.bot.send_message(chat_id=REPORT_CHANNEL, text=report_msg, parse_mode='Markdown')
 
     except Exception as e:
-        logging.error(f"General error: {e}")
-        await context.bot.send_message(chat_id=REPORT_CHANNEL_ID, text=f"❌ خطا در پردازش فایل `{doc.file_name}`: {e}")
+        logging.error(f"Error: {e}")
 
 if __name__ == '__main__':
     keep_alive()
-    # استفاده از تنظیمات برای اطمینان از دریافت پست‌های کانال
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     
-    # هندلر بدون فیلتر سختگیرانه برای تست اولیه
-    application.add_handler(MessageHandler(filters.Document.ALL & filters.ChatType.CHANNEL, process_report_file))
+    # فیلتر فقط برای اسناد در کانال
+    app.add_handler(MessageHandler(filters.ChatType.CHANNEL & filters.Document.ALL, process_report))
     
-    logging.info("Bot started. Listening for channel posts...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logging.info(f"🤖 ربات فعال شد. در حال مانیتور کانال @{SOURCE_CHANNEL}...")
+    app.run_polling(drop_pending_updates=True)
