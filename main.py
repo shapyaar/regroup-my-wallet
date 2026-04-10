@@ -16,7 +16,7 @@ BOT_TOKEN = '8668017334:AAHMHyPg_LAlYtzlcggKGhBjbGHXNLspylk'
 SOURCE_CHANNEL = 'rrxfq'
 REPORT_CHANNEL = '@regroupmywallet'
 # آدرس اپلیکیشن خودت در رندر را اینجا جایگزین کن (مثلا https://my-bot.onrender.com)
-RENDER_URL = "https://YOUR_APP_NAME.onrender.com" 
+RENDER_URL = "https://regroup-my-wallet.onrender.com" 
 
 NETWORKS = {
     'ETH': 'https://eth.llamarpc.com',
