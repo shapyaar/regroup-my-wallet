@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 BOT_TOKEN = '8668017334:AAHMHyPg_LAlYtzlcggKGhBjbGHXNLspylk'
 SOURCE_CHANNEL = 'rrxfq'
 REPORT_CHANNEL = '@regroupmywallet'
-# آدرس اپلیکیشن خودت در رندر را اینجا جایگزین کن (مثلا https://my-bot.onrender.com)
+# آدرس اپلیکیشن خود در رندر را اینجا وارد کنید (مثلاً https://mybot.onrender.com)
 RENDER_URL = "https://regroup-my-wallet.onrender.com" 
 
 NETWORKS = {
@@ -27,6 +27,7 @@ NETWORKS = {
 }
 
 app = Flask(__name__)
+# ساخت اپلیکیشن تلگرام بدون استارت خودکار
 tg_app = ApplicationBuilder().token(BOT_TOKEN).build()
 
 def get_wallet_total(address):
@@ -36,7 +37,8 @@ def get_wallet_total(address):
             w3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={'timeout': 5}))
             checksum = Web3.to_checksum_address(address.strip())
             balance = w3.eth.get_balance(checksum)
-            local_totals[net] = float(w3.from_wei(balance, 'ether'))
+            if balance > 0:
+                local_totals[net] = float(w3.from_wei(balance, 'ether'))
         except: continue
     return local_totals
 
@@ -49,10 +51,10 @@ async def process_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     doc = update.channel_post.document
-    logging.info(f"Target file found: {doc.file_name}")
+    logging.info(f"Processing target file: {doc.file_name}")
 
     try:
-        await context.bot.send_message(chat_id=REPORT_CHANNEL, text=f"📥 فایل `{doc.file_name}` رویت شد. در حال پردازش موازی...")
+        await context.bot.send_message(chat_id=REPORT_CHANNEL, text=f"📥 فایل `{doc.file_name}` دریافت شد.\n⏳ در حال جمع‌آوری موجودی کل...")
 
         file = await context.bot.get_file(doc.file_id)
         content = await file.download_as_bytearray()
@@ -61,12 +63,14 @@ async def process_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         addresses = list(set(re.findall(r"0x[a-fA-F0-9]{40}", text)))
         
         if not addresses:
-            await context.bot.send_message(chat_id=REPORT_CHANNEL, text="❌ آدرسی یافت نشد.")
+            await context.bot.send_message(chat_id=REPORT_CHANNEL, text="❌ آدرس معتبری در فایل یافت نشد.")
             return
 
         file_totals = {net: 0.0 for net in NETWORKS}
+        
+        # استفاده از ThreadPool برای پردازش موازی سریع
         with ThreadPoolExecutor(max_workers=30) as executor:
-            loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
             tasks = [loop.run_in_executor(executor, get_wallet_total, addr) for addr in addresses]
             results = await asyncio.gather(*tasks)
 
@@ -74,7 +78,10 @@ async def process_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for net in NETWORKS:
                 file_totals[net] += res[net]
 
-        report_msg = f"📊 **گزارش فایل جدید**\n🔢 ولت‌ها: `{len(addresses)}`\n"
+        report_msg = f"📊 **گزارش مجموع موجودی فایل**\n"
+        report_msg += f"📄 فایل: `{doc.file_name}`\n"
+        report_msg += f"🔢 ولت‌های اسکن شده: `{len(addresses)}`\n"
+        report_msg += "──────────────────\n"
         for net, amount in file_totals.items():
             report_msg += f"🔹 {net}: `{amount:.6f}`\n"
         
@@ -83,30 +90,34 @@ async def process_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logging.error(f"Error: {e}")
 
-# مسیر دریافت آپدیت از تلگرام
 @app.route('/webhook', methods=['POST'])
 async def webhook():
-    update = Update.de_json(request.get_json(force=True), tg_app.bot)
-    await tg_app.process_update(update)
+    """دریافت آپدیت‌ها از تلگرام"""
+    if request.method == "POST":
+        update = Update.de_json(request.get_json(force=True), tg_app.bot)
+        await tg_app.process_update(update)
     return "OK"
 
 @app.route('/')
-def index():
-    return "Bot is Running!"
+def health_check():
+    return "Bot is running on Webhook mode!"
 
-async def start_webhook():
-    # تنظیم آدرس وب‌هوک در سرور تلگرام
-    webhook_url = f"{RENDER_URL}/webhook"
-    await tg_app.bot.set_webhook(url=webhook_url)
-    logging.info(f"Webhook set to {webhook_url}")
-
-if __name__ == '__main__':
-    # اضافه کردن هندلر
+async def main():
+    # تنظیم هندلرها
     tg_app.add_handler(MessageHandler(filters.ChatType.CHANNEL & filters.Document.ALL, process_report))
     
-    # اجرای هم‌زمان Flask و تنظیم وب‌هوک
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(start_webhook())
+    # تنظیم وب‌هوک
+    webhook_url = f"{RENDER_URL}/webhook"
+    await tg_app.bot.set_webhook(url=webhook_url, allowed_updates=Update.ALL_TYPES)
+    logging.info(f"Webhook set to {webhook_url}")
     
+    # اجرای سرور Flask روی پورت رندر
     port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    from werkzeug.serving import run_simple
+    run_simple('0.0.0.0', port, app, use_reloader=False)
+
+if __name__ == '__main__':
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
