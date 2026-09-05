@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 # --- تنظیمات اصلی ---
 BOT_TOKEN = '8794980895:AAG7PSNwSZiWVyxj58POCVTV9ZgPMG-LJ_U'
-SOURCE_CHANNEL = 'rrxfq'
+SOURCE_CHANNEL = -1003533610913
 REPORT_CHANNEL = -1003893481541
 # آدرس اپلیکیشن خود در رندر را اینجا وارد کنید (مثلاً https://mybot.onrender.com)
 RENDER_URL = "https://regroupmywallet.onrender.com" 
