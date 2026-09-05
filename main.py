@@ -12,7 +12,7 @@ from web3 import Web3
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 # --- تنظیمات اصلی ---
-BOT_TOKEN = '8644566801:AAGlL5vD4o4IvtV4yYHiukuLqLMfC1ouEMY'
+BOT_TOKEN = '8917572946:AAH0Mt219AAl0ZzZ4xre2WsjV7aQESDhyBE'
 SOURCE_CHANNEL = 'rrxfq'
 REPORT_CHANNEL = '@regroupmywallet'
 # آدرس اپلیکیشن خود در رندر را اینجا وارد کنید (مثلاً https://mybot.onrender.com)
