@@ -47,7 +47,7 @@ async def process_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     chat = update.channel_post.chat
-    if not chat.username or chat.username.lower() != SOURCE_CHANNEL.lower():
+    if chat.id != SOURCE_CHANNEL:
         return
 
     doc = update.channel_post.document
