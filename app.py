@@ -171,28 +171,301 @@ def release_db_connection(conn):
 
 
 def init_db():
-    logger.info(
-        "Initializing PostgreSQL"
-    )
+    """
+    Initialize and migrate PostgreSQL schema safely.
+
+    Important:
+    - Existing wallet data is preserved.
+    - Old wallets table without `id` is migrated.
+    - Missing columns are added automatically.
+    - Existing meta table is preserved.
+    """
+
+    logging.info("Initializing PostgreSQL")
 
     conn = None
+    cur = None
 
     try:
-        conn = get_db_connection()
-
+        conn = get_conn()
+        conn.autocommit = False
         cur = conn.cursor()
 
-        # Wallets
+        # ====================================================
+        # Check whether wallets table exists
+        # ====================================================
+
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS wallets (
-                id BIGSERIAL PRIMARY KEY,
-                address TEXT NOT NULL UNIQUE,
-                source_uploaded_at TIMESTAMPTZ,
-                added_at TIMESTAMPTZ DEFAULT NOW()
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.tables
+                WHERE table_schema = 'public'
+                  AND table_name = 'wallets'
             )
         """)
 
-        # Metadata
+        wallets_exists = cur.fetchone()[0]
+
+        # ====================================================
+        # Create wallets table if it does not exist
+        # ====================================================
+
+        if not wallets_exists:
+
+            logging.info(
+                "wallets table does not exist - creating"
+            )
+
+            cur.execute("""
+                CREATE TABLE wallets (
+                    id BIGSERIAL PRIMARY KEY,
+                    address TEXT NOT NULL UNIQUE,
+                    source_uploaded_at TIMESTAMPTZ,
+                    added_at TIMESTAMPTZ DEFAULT NOW()
+                )
+            """)
+
+        else:
+
+            logging.info(
+                "wallets table already exists - checking schema"
+            )
+
+            # ------------------------------------------------
+            # Check columns
+            # ------------------------------------------------
+
+            cur.execute("""
+                SELECT column_name
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'wallets'
+            """)
+
+            existing_columns = {
+                row[0]
+                for row in cur.fetchall()
+            }
+
+            logging.info(
+                "Existing wallets columns: %s",
+                sorted(existing_columns)
+            )
+
+            # ------------------------------------------------
+            # Add id column if missing
+            # ------------------------------------------------
+
+            if "id" not in existing_columns:
+
+                logging.warning(
+                    "wallets.id is missing - migrating table"
+                )
+
+                # Create sequence if necessary
+                cur.execute("""
+                    CREATE SEQUENCE IF NOT EXISTS wallets_id_seq
+                    AS BIGINT
+                    START WITH 1
+                """)
+
+                # Add id column
+                cur.execute("""
+                    ALTER TABLE wallets
+                    ADD COLUMN id BIGINT
+                """)
+
+                # Fill existing rows
+                cur.execute("""
+                    UPDATE wallets
+                    SET id = nextval('wallets_id_seq')
+                    WHERE id IS NULL
+                """)
+
+                # Make future inserts automatic
+                cur.execute("""
+                    ALTER TABLE wallets
+                    ALTER COLUMN id
+                    SET DEFAULT nextval('wallets_id_seq')
+                """)
+
+                # Set sequence after existing IDs
+                cur.execute("""
+                    SELECT COALESCE(MAX(id), 0)
+                    FROM wallets
+                """)
+
+                max_id = cur.fetchone()[0]
+
+                cur.execute(
+                    """
+                    SELECT setval(
+                        'wallets_id_seq',
+                        %s,
+                        %s
+                    )
+                    """,
+                    (
+                        max_id if max_id > 0 else 1,
+                        max_id > 0
+                    )
+                )
+
+                # Make id NOT NULL
+                cur.execute("""
+                    ALTER TABLE wallets
+                    ALTER COLUMN id SET NOT NULL
+                """)
+
+                # Add primary key only if one does not already exist
+                cur.execute("""
+                    SELECT constraint_name
+                    FROM information_schema.table_constraints
+                    WHERE table_schema = 'public'
+                      AND table_name = 'wallets'
+                      AND constraint_type = 'PRIMARY KEY'
+                """)
+
+                has_primary_key = cur.fetchone() is not None
+
+                if not has_primary_key:
+
+                    cur.execute("""
+                        ALTER TABLE wallets
+                        ADD CONSTRAINT wallets_pkey
+                        PRIMARY KEY (id)
+                    """)
+
+                logging.info(
+                    "wallets.id migration completed"
+                )
+
+            # ------------------------------------------------
+            # Add address if missing
+            # ------------------------------------------------
+
+            if "address" not in existing_columns:
+
+                raise RuntimeError(
+                    "Existing wallets table does not contain "
+                    "an 'address' column. Automatic migration "
+                    "cannot safely determine the wallet address column."
+                )
+
+            # ------------------------------------------------
+            # Add source_uploaded_at if missing
+            # ------------------------------------------------
+
+            if "source_uploaded_at" not in existing_columns:
+
+                logging.info(
+                    "Adding wallets.source_uploaded_at"
+                )
+
+                cur.execute("""
+                    ALTER TABLE wallets
+                    ADD COLUMN source_uploaded_at TIMESTAMPTZ
+                """)
+
+            # ------------------------------------------------
+            # Add added_at if missing
+            # ------------------------------------------------
+
+            if "added_at" not in existing_columns:
+
+                logging.info(
+                    "Adding wallets.added_at"
+                )
+
+                cur.execute("""
+                    ALTER TABLE wallets
+                    ADD COLUMN added_at TIMESTAMPTZ DEFAULT NOW()
+                """)
+
+                cur.execute("""
+                    UPDATE wallets
+                    SET added_at = NOW()
+                    WHERE added_at IS NULL
+                """)
+
+        # ====================================================
+        # Ensure address is unique
+        # ====================================================
+
+        cur.execute("""
+            SELECT constraint_name
+            FROM information_schema.table_constraints
+            WHERE table_schema = 'public'
+              AND table_name = 'wallets'
+              AND constraint_type = 'UNIQUE'
+        """)
+
+        unique_constraints = {
+            row[0]
+            for row in cur.fetchall()
+        }
+
+        # Check for an existing unique index on address
+        cur.execute("""
+            SELECT indexname
+            FROM pg_indexes
+            WHERE schemaname = 'public'
+              AND tablename = 'wallets'
+        """)
+
+        indexes = {
+            row[0]
+            for row in cur.fetchall()
+        }
+
+        address_unique_exists = any(
+            "address" in index_name.lower()
+            and "uniq" in index_name.lower()
+            for index_name in indexes
+        )
+
+        if not address_unique_exists:
+
+            try:
+
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                    wallets_address_unique_idx
+                    ON wallets (LOWER(address))
+                """)
+
+                logging.info(
+                    "Wallet address unique index ensured"
+                )
+
+            except psycopg2.errors.UniqueViolation:
+
+                conn.rollback()
+
+                logging.warning(
+                    "Duplicate wallet addresses detected. "
+                    "Cleaning duplicates before creating index."
+                )
+
+                cur = conn.cursor()
+
+                cur.execute("""
+                    DELETE FROM wallets a
+                    USING wallets b
+                    WHERE a.id > b.id
+                      AND LOWER(a.address) = LOWER(b.address)
+                """)
+
+                cur.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                    wallets_address_unique_idx
+                    ON wallets (LOWER(address))
+                """)
+
+        # ====================================================
+        # Meta table
+        # ====================================================
+
         cur.execute("""
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
@@ -200,36 +473,34 @@ def init_db():
             )
         """)
 
-        # Index
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_wallets_id
-            ON wallets(id)
-        """)
+        # ====================================================
+        # Commit
+        # ====================================================
 
         conn.commit()
 
-        cur.close()
-
-        logger.info(
+        logging.info(
             "PostgreSQL initialized successfully"
         )
 
     except Exception:
-        if conn:
-            try:
-                conn.rollback()
-            except Exception:
-                pass
 
-        logger.exception(
+        if conn:
+            conn.rollback()
+
+        logging.exception(
             "PostgreSQL initialization failed"
         )
 
         raise
 
     finally:
-        release_db_connection(conn)
 
+        if cur:
+            cur.close()
+
+        if conn:
+            conn.close()
 
 def save_wallet(address, source_uploaded_at):
     conn = None
