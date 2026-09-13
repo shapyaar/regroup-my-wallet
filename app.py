@@ -875,31 +875,27 @@ def start_background_workers():
     ).start()
 
 
-if __name__ == "__main__":
-
+def validate_config():
     if not BOT_TOKEN:
-        raise RuntimeError(
-            "BOT_TOKEN is missing"
-        )
+        raise RuntimeError("BOT_TOKEN is missing")
 
     if not DATABASE_URL:
-        raise RuntimeError(
-            "DATABASE_URL is missing"
-        )
+        raise RuntimeError("DATABASE_URL is missing")
 
     if not SOURCE_CHANNEL:
-        raise RuntimeError(
-            "SOURCE_CHANNEL is missing"
-        )
+        raise RuntimeError("SOURCE_CHANNEL is missing")
 
     if not REPORT_CHANNEL:
-        raise RuntimeError(
-            "REPORT_CHANNEL is missing"
-        )
+        raise RuntimeError("REPORT_CHANNEL is missing")
 
-    init_db()
 
-    start_background_workers()
+# این بخش هنگام import شدن توسط Gunicorn اجرا می‌شود
+validate_config()
+init_db()
+start_background_workers()
+
+
+if __name__ == "__main__":
 
     port = int(
         os.getenv(
@@ -912,3 +908,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
+
