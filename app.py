@@ -10,6 +10,7 @@ from datetime import datetime, timezone
 from concurrent.futures import ThreadPoolExecutor
 
 import psycopg2
+from psycopg2 import pool
 from flask import Flask, request
 from telegram import Bot, Update
 from telegram.request import HTTPXRequest
@@ -17,7 +18,7 @@ from web3 import Web3
 
 
 # ============================================================
-# تنظیمات
+# Logging
 # ============================================================
 
 logging.basicConfig(
@@ -25,16 +26,43 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s"
 )
 
+logger = logging.getLogger(__name__)
+
+
+# ============================================================
+# Configuration
+# ============================================================
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 SOURCE_CHANNEL = int(os.getenv("SOURCE_CHANNEL", "0"))
 REPORT_CHANNEL = int(os.getenv("REPORT_CHANNEL", "0"))
 
-HOURLY_INTERVAL_MIN = int(os.getenv("HOURLY_INTERVAL_MIN", "60"))
-EXPORT_INTERVAL_MIN = int(os.getenv("EXPORT_INTERVAL_MIN", "120"))
+HOURLY_INTERVAL_MIN = int(
+    os.getenv("HOURLY_INTERVAL_MIN", "60")
+)
 
-BATCH_SIZE = 300
+EXPORT_INTERVAL_MIN = int(
+    os.getenv("EXPORT_INTERVAL_MIN", "120")
+)
+
+BATCH_SIZE = int(
+    os.getenv("BATCH_SIZE", "300")
+)
+
+RPC_WORKERS = int(
+    os.getenv("RPC_WORKERS", "10")
+)
+
+DB_MIN_CONNECTIONS = int(
+    os.getenv("DB_MIN_CONNECTIONS", "1")
+)
+
+DB_MAX_CONNECTIONS = int(
+    os.getenv("DB_MAX_CONNECTIONS", "10")
+)
+
 
 NETWORKS = {
     "ETH": "https://eth.llamarpc.com",
@@ -47,24 +75,63 @@ NETWORKS = {
 # ============================================================
 
 app = Flask(__name__)
+
 task_queue = queue.Queue()
 
+worker_started = False
+worker_lock = threading.Lock()
+
 
 # ============================================================
-# PostgreSQL
+# PostgreSQL Connection Pool
 # ============================================================
 
-def get_conn():
-    return psycopg2.connect(
+db_pool = None
+
+
+def init_db_pool():
+    global db_pool
+
+    if db_pool is not None:
+        return
+
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is missing")
+
+    logger.info("Creating PostgreSQL connection pool")
+
+    db_pool = psycopg2.pool.ThreadedConnectionPool(
+        DB_MIN_CONNECTIONS,
+        DB_MAX_CONNECTIONS,
         DATABASE_URL,
-        sslmode="require"
+        sslmode="require",
+        connect_timeout=15
     )
 
+    logger.info("PostgreSQL connection pool created")
+
+
+def get_conn():
+    if db_pool is None:
+        init_db_pool()
+
+    return db_pool.getconn()
+
+
+def release_conn(conn):
+    if db_pool is not None and conn is not None:
+        db_pool.putconn(conn)
+
+
+# ============================================================
+# Database Initialization
+# ============================================================
 
 def init_db():
-    conn = get_conn()
+    conn = None
 
     try:
+        conn = get_conn()
         cur = conn.cursor()
 
         cur.execute("""
@@ -77,24 +144,61 @@ def init_db():
         """)
 
         cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_wallets_address
+            ON wallets(address)
+        """)
+
+        cur.execute("""
             CREATE TABLE IF NOT EXISTS meta (
                 key TEXT PRIMARY KEY,
                 value TEXT
             )
         """)
 
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS processed_files (
+                file_id TEXT PRIMARY KEY,
+                file_name TEXT,
+                processed_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS processed_updates (
+                update_id BIGINT PRIMARY KEY,
+                processed_at TIMESTAMPTZ DEFAULT NOW()
+            )
+        """)
+
         conn.commit()
 
-        logging.info("PostgreSQL initialized")
+        logger.info("PostgreSQL initialized successfully")
+
+    except Exception:
+        if conn:
+            conn.rollback()
+
+        logger.exception("Database initialization failed")
+        raise
 
     finally:
-        conn.close()
+        release_conn(conn)
 
+
+# ============================================================
+# Wallet Database Functions
+# ============================================================
 
 def save_wallet(address, source_uploaded_at):
-    conn = get_conn()
+    """
+    Insert wallet.
+    Returns True if inserted, False if already existed.
+    """
+
+    conn = None
 
     try:
+        conn = get_conn()
         cur = conn.cursor()
 
         cur.execute("""
@@ -103,21 +207,33 @@ def save_wallet(address, source_uploaded_at):
             VALUES
                 (%s, %s)
             ON CONFLICT (address) DO NOTHING
+            RETURNING id
         """, (
             address.lower(),
             source_uploaded_at
         ))
 
+        inserted = cur.fetchone() is not None
+
         conn.commit()
 
+        return inserted
+
+    except Exception:
+        if conn:
+            conn.rollback()
+
+        raise
+
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 def get_all_wallets():
-    conn = get_conn()
+    conn = None
 
     try:
+        conn = get_conn()
         cur = conn.cursor()
 
         cur.execute("""
@@ -132,17 +248,46 @@ def get_all_wallets():
         return cur.fetchall()
 
     finally:
-        conn.close()
+        release_conn(conn)
 
 
-def get_meta(key, default=None):
-    conn = get_conn()
+def get_wallet_count():
+    conn = None
 
     try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM wallets
+        """)
+
+        row = cur.fetchone()
+
+        return int(row[0]) if row else 0
+
+    finally:
+        release_conn(conn)
+
+
+# ============================================================
+# Meta
+# ============================================================
+
+def get_meta(key, default=None):
+    conn = None
+
+    try:
+        conn = get_conn()
         cur = conn.cursor()
 
         cur.execute(
-            "SELECT value FROM meta WHERE key = %s",
+            """
+            SELECT value
+            FROM meta
+            WHERE key = %s
+            """,
             (key,)
         )
 
@@ -151,20 +296,24 @@ def get_meta(key, default=None):
         return row[0] if row else default
 
     finally:
-        conn.close()
+        release_conn(conn)
 
 
 def set_meta(key, value):
-    conn = get_conn()
+    conn = None
 
     try:
+        conn = get_conn()
         cur = conn.cursor()
 
         cur.execute("""
-            INSERT INTO meta (key, value)
-            VALUES (%s, %s)
+            INSERT INTO meta
+                (key, value)
+            VALUES
+                (%s, %s)
             ON CONFLICT (key)
-            DO UPDATE SET value = EXCLUDED.value
+            DO UPDATE SET
+                value = EXCLUDED.value
         """, (
             key,
             value
@@ -172,8 +321,112 @@ def set_meta(key, value):
 
         conn.commit()
 
+    except Exception:
+        if conn:
+            conn.rollback()
+
+        raise
+
     finally:
-        conn.close()
+        release_conn(conn)
+
+
+# ============================================================
+# Processed Files / Updates
+# ============================================================
+
+def file_already_processed(file_id):
+    conn = None
+
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT 1
+            FROM processed_files
+            WHERE file_id = %s
+            LIMIT 1
+        """, (
+            str(file_id),
+        ))
+
+        return cur.fetchone() is not None
+
+    finally:
+        release_conn(conn)
+
+
+def mark_file_processed(file_id, file_name):
+    conn = None
+
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT INTO processed_files
+                (file_id, file_name)
+            VALUES
+                (%s, %s)
+            ON CONFLICT (file_id) DO NOTHING
+            RETURNING file_id
+        """, (
+            str(file_id),
+            file_name
+        ))
+
+        inserted = cur.fetchone() is not None
+
+        conn.commit()
+
+        return inserted
+
+    except Exception:
+        if conn:
+            conn.rollback()
+
+        raise
+
+    finally:
+        release_conn(conn)
+
+
+def update_already_processed(update_id):
+    if not update_id:
+        return False
+
+    conn = None
+
+    try:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT INTO processed_updates
+                (update_id)
+            VALUES
+                (%s)
+            ON CONFLICT (update_id) DO NOTHING
+            RETURNING update_id
+        """, (
+            int(update_id),
+        ))
+
+        inserted = cur.fetchone() is not None
+
+        conn.commit()
+
+        return not inserted
+
+    except Exception:
+        if conn:
+            conn.rollback()
+
+        raise
+
+    finally:
+        release_conn(conn)
 
 
 # ============================================================
@@ -191,7 +444,7 @@ def create_bot(pool_size=20):
 
 
 # ============================================================
-# فایل ورودی
+# Input File
 # ============================================================
 
 ADDRESS_PATTERN = re.compile(
@@ -200,11 +453,45 @@ ADDRESS_PATTERN = re.compile(
 )
 
 
-async def handle_file(file_id, file_name, uploaded_at):
+# ============================================================
+# File Handler
+# ============================================================
+
+async def handle_file(
+    file_id,
+    file_name,
+    uploaded_at
+):
     bot = create_bot()
 
     try:
-        logging.info(
+        logger.info(
+            "Processing source file: %s | file_id=%s",
+            file_name,
+            file_id
+        )
+
+        # ----------------------------------------------------
+        # Atomic duplicate protection
+        # ----------------------------------------------------
+
+        claimed = mark_file_processed(
+            file_id,
+            file_name
+        )
+
+        if not claimed:
+            logger.info(
+                "File already processed: %s",
+                file_id
+            )
+            return
+
+        # ----------------------------------------------------
+        # Download
+        # ----------------------------------------------------
+
+        logger.info(
             "Downloading source file: %s",
             file_name
         )
@@ -218,9 +505,12 @@ async def handle_file(file_id, file_name, uploaded_at):
             errors="ignore"
         )
 
+        # ----------------------------------------------------
+        # Extract addresses
+        # ----------------------------------------------------
+
         addresses = []
 
-        # ترتیب فایل حفظ می‌شود
         for line in text.splitlines():
 
             match = ADDRESS_PATTERN.search(line)
@@ -231,29 +521,59 @@ async def handle_file(file_id, file_name, uploaded_at):
                 addresses.append(address)
 
         if not addresses:
-            logging.warning(
+
+            logger.warning(
                 "No addresses found in %s",
                 file_name
             )
+
+            await bot.send_message(
+                chat_id=REPORT_CHANNEL,
+                text=(
+                    "⚠️ <b>فایل دریافت شد ولی آدرسی پیدا نشد</b>\n\n"
+                    f"📄 فایل: <code>{file_name}</code>"
+                ),
+                parse_mode="HTML"
+            )
+
             return
+
+        # ----------------------------------------------------
+        # Save addresses
+        # ----------------------------------------------------
 
         saved = 0
 
-        for address in addresses:
-
-            before = len(get_all_wallets())
-
-            save_wallet(
-                address,
-                uploaded_at
+        # جلوگیری از تکرار داخل همان فایل
+        unique_addresses = list(
+            dict.fromkeys(
+                address.lower()
+                for address in addresses
             )
+        )
 
-            after = len(get_all_wallets())
+        for address in unique_addresses:
 
-            if after > before:
-                saved += 1
+            try:
 
-        total = len(get_all_wallets())
+                if save_wallet(
+                    address,
+                    uploaded_at
+                ):
+                    saved += 1
+
+            except Exception:
+
+                logger.exception(
+                    "Failed saving wallet: %s",
+                    address
+                )
+
+        total = get_wallet_count()
+
+        # ----------------------------------------------------
+        # Report
+        # ----------------------------------------------------
 
         await bot.send_message(
             chat_id=REPORT_CHANNEL,
@@ -261,39 +581,45 @@ async def handle_file(file_id, file_name, uploaded_at):
                 "📥 <b>فایل جدید دریافت شد</b>\n\n"
                 f"📄 فایل: <code>{file_name}</code>\n"
                 f"🕐 زمان انتشار: <code>{uploaded_at}</code>\n"
-                f"🔢 آدرس‌های داخل فایل: <code>{len(addresses)}</code>\n"
+                f"🔢 آدرس‌های پیدا شده: <code>{len(addresses)}</code>\n"
+                f"🔢 آدرس‌های یکتا: <code>{len(unique_addresses)}</code>\n"
                 f"➕ آدرس جدید: <code>{saved}</code>\n"
                 f"📦 کل دیتابیس: <code>{total}</code>"
             ),
             parse_mode="HTML"
         )
 
-        logging.info(
-            "File processed: %s | addresses=%s | new=%s",
+        logger.info(
+            "File processed successfully | file=%s | found=%s | unique=%s | new=%s",
             file_name,
             len(addresses),
+            len(unique_addresses),
             saved
         )
 
     except Exception:
-        logging.exception(
-            "File processing failed"
+
+        logger.exception(
+            "File processing failed: %s",
+            file_name
         )
 
 
 # ============================================================
-# موجودی
+# Web3 Providers
 # ============================================================
 
-def get_wallet_balance(address):
-    result = {
-        "ETH": 0.0,
-        "BSC": 0.0
-    }
+WEB3_PROVIDERS = {}
+
+
+def init_web3():
+
+    logger.info("Initializing Web3 providers")
 
     for network, rpc in NETWORKS.items():
 
         try:
+
             w3 = Web3(
                 Web3.HTTPProvider(
                     rpc,
@@ -303,16 +629,46 @@ def get_wallet_balance(address):
                 )
             )
 
-            if not w3.is_connected():
-                logging.warning(
-                    "%s RPC not connected",
-                    network
-                )
-                continue
+            WEB3_PROVIDERS[network] = w3
 
-            checksum = Web3.to_checksum_address(
-                address
+            logger.info(
+                "Web3 provider initialized: %s",
+                network
             )
+
+        except Exception:
+
+            logger.exception(
+                "Failed initializing Web3 provider: %s",
+                network
+            )
+
+
+# ============================================================
+# Balance
+# ============================================================
+
+def get_wallet_balance(address):
+
+    result = {
+        "ETH": 0.0,
+        "BSC": 0.0
+    }
+
+    try:
+        checksum = Web3.to_checksum_address(
+            address
+        )
+    except Exception:
+        logger.warning(
+            "Invalid wallet address: %s",
+            address
+        )
+        return result
+
+    for network, w3 in WEB3_PROVIDERS.items():
+
+        try:
 
             balance = w3.eth.get_balance(
                 checksum
@@ -327,7 +683,7 @@ def get_wallet_balance(address):
 
         except Exception as e:
 
-            logging.warning(
+            logger.warning(
                 "Balance error | network=%s | address=%s | error=%s",
                 network,
                 address,
@@ -338,26 +694,28 @@ def get_wallet_balance(address):
 
 
 # ============================================================
-# گزارش ساعتی
+# Hourly Report
 # ============================================================
 
 async def handle_hourly():
+
     bot = create_bot(30)
 
     wallets = get_all_wallets()
 
     total_wallets = len(wallets)
 
-    logging.info(
+    logger.info(
         "Hourly scan started | total=%s",
         total_wallets
     )
 
     if not wallets:
 
-        set_meta(
-            "last_hourly",
-            datetime.now(timezone.utc).isoformat()
+        await bot.send_message(
+            chat_id=REPORT_CHANNEL,
+            text="ℹ️ <b>گزارش ساعتی:</b> دیتابیس خالی است.",
+            parse_mode="HTML"
         )
 
         return
@@ -380,31 +738,37 @@ async def handle_hourly():
         parse_mode="HTML"
     )
 
-    for start in range(
-        0,
-        total_wallets,
-        BATCH_SIZE
-    ):
+    # --------------------------------------------------------
+    # Executor واحد برای کل scan
+    # --------------------------------------------------------
 
-        batch = wallets[
-            start:start + BATCH_SIZE
-        ]
+    loop = asyncio.get_running_loop()
 
-        part_number = (
-            start // BATCH_SIZE
-        ) + 1
+    executor = ThreadPoolExecutor(
+        max_workers=RPC_WORKERS
+    )
 
-        logging.info(
-            "Scanning batch %s/%s",
-            part_number,
-            total_parts
-        )
+    try:
 
-        loop = asyncio.get_running_loop()
+        for start in range(
+            0,
+            total_wallets,
+            BATCH_SIZE
+        ):
 
-        with ThreadPoolExecutor(
-            max_workers=10
-        ) as executor:
+            batch = wallets[
+                start:start + BATCH_SIZE
+            ]
+
+            part_number = (
+                start // BATCH_SIZE
+            ) + 1
+
+            logger.info(
+                "Scanning batch %s/%s",
+                part_number,
+                total_parts
+            )
 
             futures = [
                 loop.run_in_executor(
@@ -416,70 +780,103 @@ async def handle_hourly():
             ]
 
             results = await asyncio.gather(
-                *futures
+                *futures,
+                return_exceptions=True
             )
 
-        batch_eth = 0.0
-        batch_bsc = 0.0
-        batch_rich = 0
+            batch_eth = 0.0
+            batch_bsc = 0.0
+            batch_rich = 0
 
-        for row, balance in zip(
-            batch,
-            results
-        ):
+            for row, balance in zip(
+                batch,
+                results
+            ):
 
-            wallet_id = row[0]
-            address = row[1]
-            uploaded_at = row[2]
+                wallet_id = row[0]
+                address = row[1]
+                uploaded_at = row[2]
 
-            eth = balance["ETH"]
-            bsc = balance["BSC"]
+                if isinstance(
+                    balance,
+                    Exception
+                ):
 
-            batch_eth += eth
-            batch_bsc += bsc
+                    logger.warning(
+                        "Wallet balance failed | address=%s | error=%s",
+                        address,
+                        balance
+                    )
 
-            total_eth += eth
-            total_bsc += bsc
+                    continue
 
-            if eth > 0 or bsc > 0:
+                eth = balance["ETH"]
+                bsc = balance["BSC"]
 
-                batch_rich += 1
-                rich_count += 1
+                batch_eth += eth
+                batch_bsc += bsc
 
-                uploaded_text = (
-                    uploaded_at.isoformat()
-                    if uploaded_at
-                    else "نامشخص"
-                )
+                total_eth += eth
+                total_bsc += bsc
 
-                await bot.send_message(
-                    chat_id=REPORT_CHANNEL,
-                    text=(
-                        "💰 <b>آدرس دارای موجودی</b>\n\n"
-                        f"🔢 شناسه: <code>{wallet_id}</code>\n"
-                        f"📍 آدرس:\n"
-                        f"<code>{address}</code>\n\n"
-                        f"🕐 زمان انتشار فایل:\n"
-                        f"<code>{uploaded_text}</code>\n\n"
-                        f"🔹 ETH: <code>{eth:.8f}</code>\n"
-                        f"🔹 BSC: <code>{bsc:.8f}</code>"
-                    ),
-                    parse_mode="HTML"
-                )
+                if eth > 0 or bsc > 0:
 
-                await asyncio.sleep(0.5)
+                    batch_rich += 1
+                    rich_count += 1
 
-        await bot.send_message(
-            chat_id=REPORT_CHANNEL,
-            text=(
-                f"📊 <b>بخش {part_number}/{total_parts}</b>\n\n"
-                f"🔢 تعداد آدرس: <code>{len(batch)}</code>\n"
-                f"🔹 ETH: <code>{batch_eth:.8f}</code>\n"
-                f"🔹 BSC: <code>{batch_bsc:.8f}</code>\n"
-                f"💰 دارای موجودی: <code>{batch_rich}</code>"
-            ),
-            parse_mode="HTML"
+                    uploaded_text = (
+                        uploaded_at.isoformat()
+                        if uploaded_at
+                        else "نامشخص"
+                    )
+
+                    try:
+
+                        await bot.send_message(
+                            chat_id=REPORT_CHANNEL,
+                            text=(
+                                "💰 <b>آدرس دارای موجودی</b>\n\n"
+                                f"🔢 شناسه: <code>{wallet_id}</code>\n"
+                                f"📍 آدرس:\n"
+                                f"<code>{address}</code>\n\n"
+                                f"🕐 زمان انتشار فایل:\n"
+                                f"<code>{uploaded_text}</code>\n\n"
+                                f"🔹 ETH: <code>{eth:.8f}</code>\n"
+                                f"🔹 BSC: <code>{bsc:.8f}</code>"
+                            ),
+                            parse_mode="HTML"
+                        )
+
+                    except Exception:
+
+                        logger.exception(
+                            "Failed sending rich wallet report: %s",
+                            address
+                        )
+
+                    await asyncio.sleep(0.5)
+
+            await bot.send_message(
+                chat_id=REPORT_CHANNEL,
+                text=(
+                    f"📊 <b>بخش {part_number}/{total_parts}</b>\n\n"
+                    f"🔢 تعداد آدرس: <code>{len(batch)}</code>\n"
+                    f"🔹 ETH: <code>{batch_eth:.8f}</code>\n"
+                    f"🔹 BSC: <code>{batch_bsc:.8f}</code>\n"
+                    f"💰 دارای موجودی: <code>{batch_rich}</code>"
+                ),
+                parse_mode="HTML"
+            )
+
+    finally:
+
+        executor.shutdown(
+            wait=True
         )
+
+    # --------------------------------------------------------
+    # Final report
+    # --------------------------------------------------------
 
     await bot.send_message(
         chat_id=REPORT_CHANNEL,
@@ -493,13 +890,10 @@ async def handle_hourly():
         parse_mode="HTML"
     )
 
-    set_meta(
-        "last_hourly",
-        datetime.now(timezone.utc).isoformat()
-    )
-
-    logging.info(
-        "Hourly scan completed"
+    logger.info(
+        "Hourly scan completed | wallets=%s | rich=%s",
+        total_wallets,
+        rich_count
     )
 
 
@@ -508,15 +902,15 @@ async def handle_hourly():
 # ============================================================
 
 async def handle_export():
+
     bot = create_bot()
 
     wallets = get_all_wallets()
 
     if not wallets:
 
-        set_meta(
-            "last_export",
-            datetime.now(timezone.utc).isoformat()
+        logger.info(
+            "Export skipped: database is empty"
         )
 
         return
@@ -560,13 +954,9 @@ async def handle_export():
         parse_mode="HTML"
     )
 
-    set_meta(
-        "last_export",
-        datetime.now(timezone.utc).isoformat()
-    )
-
-    logging.info(
-        "Export sent"
+    logger.info(
+        "Export sent | total=%s",
+        len(wallets)
     )
 
 
@@ -576,8 +966,8 @@ async def handle_export():
 
 def worker_loop():
 
-    logging.info(
-        "Worker started"
+    logger.info(
+        "Background worker started"
     )
 
     while True:
@@ -586,10 +976,10 @@ def worker_loop():
 
         try:
 
-            task_type = task["type"]
+            task_type = task.get("type")
 
-            logging.info(
-                "Processing: %s",
+            logger.info(
+                "Processing task: %s",
                 task_type
             )
 
@@ -621,13 +1011,20 @@ def worker_loop():
                         handle_export()
                     )
 
+                else:
+
+                    logger.warning(
+                        "Unknown task type: %s",
+                        task_type
+                    )
+
             finally:
 
                 loop.close()
 
         except Exception:
 
-            logging.exception(
+            logger.exception(
                 "Worker task failed"
             )
 
@@ -637,12 +1034,68 @@ def worker_loop():
 
 
 # ============================================================
+# Scheduler Helpers
+# ============================================================
+
+def interval_elapsed(meta_key, interval_minutes):
+
+    last_value = get_meta(
+        meta_key
+    )
+
+    if not last_value:
+        return True
+
+    try:
+
+        previous = datetime.fromisoformat(
+            last_value
+        )
+
+        if previous.tzinfo is None:
+            previous = previous.replace(
+                tzinfo=timezone.utc
+            )
+
+        now = datetime.now(
+            timezone.utc
+        )
+
+        elapsed = (
+            now - previous
+        ).total_seconds()
+
+        return elapsed >= (
+            interval_minutes * 60
+        )
+
+    except Exception:
+
+        logger.exception(
+            "Invalid scheduler timestamp | key=%s",
+            meta_key
+        )
+
+        return True
+
+
+def task_exists(task_type):
+
+    # queue.Queue استاندارد API برای مشاهده محتوا ندارد.
+    # qsize فقط برای جلوگیری از رشد بیش از حد queue استفاده می‌شود.
+    if task_queue.qsize() >= 3:
+        return True
+
+    return False
+
+
+# ============================================================
 # Scheduler
 # ============================================================
 
 def scheduler_loop():
 
-    logging.info(
+    logger.info(
         "Scheduler started"
     )
 
@@ -654,97 +1107,42 @@ def scheduler_loop():
                 timezone.utc
             )
 
-            # -------------------------
-            # گزارش ساعتی
-            # -------------------------
+            # ------------------------------------------------
+            # Hourly
+            # ------------------------------------------------
 
-            last_hourly = get_meta(
-                "last_hourly"
-            )
+            if interval_elapsed(
+                "last_hourly",
+                HOURLY_INTERVAL_MIN
+            ):
 
-            should_hourly = False
-
-            if not last_hourly:
-
-                should_hourly = True
-
-            else:
-
-                try:
-
-                    previous = datetime.fromisoformat(
-                        last_hourly
-                    )
-
-                    elapsed = (
-                        now - previous
-                    ).total_seconds()
-
-                    if elapsed >= (
-                        HOURLY_INTERVAL_MIN * 60
-                    ):
-                        should_hourly = True
-
-                except Exception:
-
-                    should_hourly = True
-
-            if should_hourly:
-
-                if task_queue.qsize() < 3:
+                if not task_exists("hourly"):
 
                     task_queue.put({
                         "type": "hourly"
                     })
 
-                    # جلوگیری از queue شدن چندباره
+                    # زمان queue شدن ذخیره می‌شود
+                    # تا scheduler چند بار همان job را queue نکند.
                     set_meta(
                         "last_hourly",
                         now.isoformat()
                     )
 
-                    logging.info(
+                    logger.info(
                         "Hourly job queued"
                     )
 
-            # -------------------------
+            # ------------------------------------------------
             # Export
-            # -------------------------
+            # ------------------------------------------------
 
-            last_export = get_meta(
-                "last_export"
-            )
+            if interval_elapsed(
+                "last_export",
+                EXPORT_INTERVAL_MIN
+            ):
 
-            should_export = False
-
-            if not last_export:
-
-                should_export = True
-
-            else:
-
-                try:
-
-                    previous = datetime.fromisoformat(
-                        last_export
-                    )
-
-                    elapsed = (
-                        now - previous
-                    ).total_seconds()
-
-                    if elapsed >= (
-                        EXPORT_INTERVAL_MIN * 60
-                    ):
-                        should_export = True
-
-                except Exception:
-
-                    should_export = True
-
-            if should_export:
-
-                if task_queue.qsize() < 3:
+                if not task_exists("export"):
 
                     task_queue.put({
                         "type": "export"
@@ -755,17 +1153,58 @@ def scheduler_loop():
                         now.isoformat()
                     )
 
-                    logging.info(
+                    logger.info(
                         "Export job queued"
                     )
 
         except Exception:
 
-            logging.exception(
+            logger.exception(
                 "Scheduler error"
             )
 
         time.sleep(30)
+
+
+# ============================================================
+# Background Workers Startup
+# ============================================================
+
+def start_background_workers():
+
+    global worker_started
+
+    with worker_lock:
+
+        if worker_started:
+
+            logger.info(
+                "Background workers already started"
+            )
+
+            return
+
+        logger.info(
+            "Starting background workers"
+        )
+
+        threading.Thread(
+            target=worker_loop,
+            name="wallet-worker",
+            daemon=True
+        ).start()
+
+        threading.Thread(
+            target=scheduler_loop,
+            name="wallet-scheduler",
+            daemon=True
+        ).start()
+
+        worker_started = True
+
+        logger.info(
+            "Background workers started successfully"
+        )
 
 
 # ============================================================
@@ -781,8 +1220,21 @@ def webhook():
     try:
 
         data = request.get_json(
-            force=True
+            force=True,
+            silent=True
         )
+
+        if not data:
+
+            logger.warning(
+                "Webhook received without JSON"
+            )
+
+            return "OK", 200
+
+        # ----------------------------------------------------
+        # Parse Telegram update
+        # ----------------------------------------------------
 
         update = Update.de_json(
             data,
@@ -790,20 +1242,76 @@ def webhook():
         )
 
         if not update:
-            return "OK"
+            return "OK", 200
+
+        # ----------------------------------------------------
+        # Duplicate update protection
+        # ----------------------------------------------------
+
+        update_id = getattr(
+            update,
+            "update_id",
+            None
+        )
+
+        if update_id:
+
+            try:
+
+                if update_already_processed(
+                    update_id
+                ):
+
+                    logger.info(
+                        "Duplicate Telegram update ignored: %s",
+                        update_id
+                    )
+
+                    return "OK", 200
+
+            except Exception:
+
+                logger.exception(
+                    "Could not check update_id"
+                )
+
+        # ----------------------------------------------------
+        # Channel post
+        # ----------------------------------------------------
 
         if not update.channel_post:
-            return "OK"
+            return "OK", 200
 
         post = update.channel_post
 
+        # ----------------------------------------------------
+        # Source channel
+        # ----------------------------------------------------
+
         if post.chat.id != SOURCE_CHANNEL:
-            return "OK"
+
+            logger.info(
+                "Ignoring post from channel: %s",
+                post.chat.id
+            )
+
+            return "OK", 200
+
+        # ----------------------------------------------------
+        # Document
+        # ----------------------------------------------------
 
         if not post.document:
-            return "OK"
+            return "OK", 200
 
         document = post.document
+
+        file_id = document.file_id
+
+        file_name = (
+            document.file_name
+            or "unknown_file.txt"
+        )
 
         uploaded_at = (
             post.date
@@ -811,27 +1319,35 @@ def webhook():
             else datetime.now(timezone.utc)
         )
 
-        logging.info(
-            "New source file: %s",
-            document.file_name
+        logger.info(
+            "New source file: %s | file_id=%s | update_id=%s",
+            file_name,
+            file_id,
+            update_id
         )
+
+        # ----------------------------------------------------
+        # Queue
+        # ----------------------------------------------------
 
         task_queue.put({
             "type": "file",
-            "file_id": document.file_id,
-            "file_name": document.file_name,
+            "file_id": file_id,
+            "file_name": file_name,
             "uploaded_at": uploaded_at
         })
 
-        return "OK"
+        return "OK", 200
 
     except Exception:
 
-        logging.exception(
+        logger.exception(
             "Webhook error"
         )
 
-        return "OK"
+        # Telegram should receive 200 so it doesn't
+        # repeatedly resend the same webhook.
+        return "OK", 200
 
 
 # ============================================================
@@ -841,59 +1357,162 @@ def webhook():
 @app.route("/")
 def health():
 
+    # این endpoint عمداً به DB وابسته نیست.
+    # Render باید بتواند بدون DB هم سرویس HTTP را alive ببیند.
+
+    return (
+        "OK | "
+        f"Queue: {task_queue.qsize()}",
+        200
+    )
+
+
+@app.route("/health/db")
+def db_health():
+
+    conn = None
+
     try:
 
-        count = len(
-            get_all_wallets()
+        conn = get_conn()
+
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT 1"
         )
 
+        cur.fetchone()
+
         return (
-            "OK | "
-            f"Queue: {task_queue.qsize()} | "
-            f"DB: {count}"
+            "DB OK | "
+            f"Wallets: {get_wallet_count()}",
+            200
         )
 
     except Exception as e:
 
-        return f"DB ERROR: {e}", 500
+        logger.exception(
+            "Database health check failed"
+        )
+
+        return (
+            f"DB ERROR: {e}",
+            500
+        )
+
+    finally:
+
+        release_conn(conn)
+
+
+@app.route("/health/full")
+def full_health():
+
+    try:
+
+        count = get_wallet_count()
+
+        return {
+            "status": "ok",
+            "database": "ok",
+            "wallets": count,
+            "queue": task_queue.qsize(),
+            "worker_started": worker_started
+        }, 200
+
+    except Exception as e:
+
+        logger.exception(
+            "Full health check failed"
+        )
+
+        return {
+            "status": "error",
+            "error": str(e),
+            "queue": task_queue.qsize(),
+            "worker_started": worker_started
+        }, 500
 
 
 # ============================================================
-# Start
+# Configuration Validation
 # ============================================================
-
-def start_background_workers():
-
-    threading.Thread(
-        target=worker_loop,
-        daemon=True
-    ).start()
-
-    threading.Thread(
-        target=scheduler_loop,
-        daemon=True
-    ).start()
-
 
 def validate_config():
+
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is missing")
+        raise RuntimeError(
+            "BOT_TOKEN is missing"
+        )
 
     if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL is missing")
+        raise RuntimeError(
+            "DATABASE_URL is missing"
+        )
 
     if not SOURCE_CHANNEL:
-        raise RuntimeError("SOURCE_CHANNEL is missing")
+        raise RuntimeError(
+            "SOURCE_CHANNEL is missing"
+        )
 
     if not REPORT_CHANNEL:
-        raise RuntimeError("REPORT_CHANNEL is missing")
+        raise RuntimeError(
+            "REPORT_CHANNEL is missing"
+        )
+
+    logger.info(
+        "Configuration validated"
+    )
 
 
-# این بخش هنگام import شدن توسط Gunicorn اجرا می‌شود
-validate_config()
-init_db()
-start_background_workers()
+# ============================================================
+# Application Initialization
+# ============================================================
 
+def initialize_application():
+
+    logger.info(
+        "Initializing application"
+    )
+
+    validate_config()
+
+    init_db_pool()
+
+    init_db()
+
+    init_web3()
+
+    start_background_workers()
+
+    logger.info(
+        "Application initialization completed"
+    )
+
+
+# ============================================================
+# IMPORTANT:
+# Gunicorn imports "app" instead of executing
+# __main__. Therefore initialization must happen here.
+# ============================================================
+
+try:
+
+    initialize_application()
+
+except Exception:
+
+    logger.exception(
+        "Application initialization failed"
+    )
+
+    raise
+
+
+# ============================================================
+# Local Development
+# ============================================================
 
 if __name__ == "__main__":
 
@@ -904,8 +1523,12 @@ if __name__ == "__main__":
         )
     )
 
+    logger.info(
+        "Starting Flask development server on port %s",
+        port
+    )
+
     app.run(
         host="0.0.0.0",
         port=port
     )
-
